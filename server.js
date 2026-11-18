@@ -1,168 +1,434 @@
 import express from 'express';
 import { createServer } from 'node:http';
 import { Server } from 'socket.io';
-import { randomBytes, randomInt } from 'node:crypto';
+import { createHash, randomBytes, randomInt } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import path from 'node:path';
+import { quizRules as rules, validMultiplier, validSeconds } from './public/quiz-rules.js';
 
 const app = express();
-const httpServer = createServer(app);
-const io = new Server(httpServer, { cors: { origin: process.env.ALLOWED_ORIGIN || true }, pingInterval: 25000, pingTimeout: 20000, maxHttpBufferSize: 1e5 });
-const PORT = Number(process.env.PORT || 3000);
-const rooms = new Map(); // Single-process development store. Use Redis-backed room state for multi-node production.
+const server = createServer(app);
+const io = new Server(server, {
+  cors: { origin: process.env.ALLOWED_ORIGIN || true },
+  pingInterval: 25000,
+  pingTimeout: 20000,
+  maxHttpBufferSize: 100000
+});
+const rooms = new Map();
+const graceMs = 120000;
+const roomCapacity = 2500;
+const mediaBudget = 96 * 1024 * 1024;
+let mediaBytesInUse = 0;
+const colors = ['#7057ff', '#ff7058', '#06a889', '#f2a900'];
 const demoQuiz = [
   { prompt: 'Which planet is known as the Red Planet?', options: ['Venus', 'Mars', 'Jupiter', 'Mercury'], correct: 1 },
   { prompt: 'How many sides does a hexagon have?', options: ['Five', 'Six', 'Seven', 'Eight'], correct: 1 },
   { prompt: 'What is the largest ocean on Earth?', options: ['Atlantic', 'Indian', 'Arctic', 'Pacific'], correct: 3 }
 ];
-const colors = ['#7057ff', '#ff7058', '#06a889', '#f2a900'];
-const RECONNECT_GRACE_MS = 2 * 60 * 1000;
 
-app.use(express.static(path.join(path.dirname(fileURLToPath(import.meta.url)), 'public')));
-app.get('/health', (_req, res) => res.json({ ok: true, activeRooms: rooms.size, transport: 'socket.io' }));
+const token = () => randomBytes(32).toString('hex');
+const text = (value, limit) => typeof value === 'string' ? value.trim().slice(0, limit) : '';
+const codeOf = value => String(value ?? '').trim();
 
-function makeCode() {
+function problem(message, status = 400) {
+  return Object.assign(new Error(message), { status });
+}
+
+function storePicture(data, images, label) {
+  if (data == null || data === '') return null;
+  const prefix = 'data:image/jpeg;base64,';
+  if (typeof data !== 'string' || !data.startsWith(prefix) ||
+      data.length > prefix.length + 4 * Math.ceil(rules.maxImageBytes / 3)) {
+    throw problem(label + 'Please choose the picture again.');
+  }
+  const encoded = data.slice(prefix.length);
+  if (encoded.length % 4 !== 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(encoded)) {
+    throw problem(label + 'The picture upload was incomplete.');
+  }
+  const bytes = Buffer.from(encoded, 'base64');
+  if (bytes.length < 4 || bytes.length > rules.maxImageBytes ||
+      bytes[0] !== 0xff || bytes[1] !== 0xd8 || bytes[2] !== 0xff ||
+      bytes.readUInt16BE(bytes.length - 2) !== 0xffd9) {
+    throw problem(label + 'The picture could not be read.');
+  }
+  const id = createHash('sha256').update(bytes).digest('hex');
+  if (!images.has(id)) images.set(id, bytes);
+  return id;
+}
+
+function createRoom(spec) {
+  const input = spec?.questions ?? demoQuiz;
+  if (!Array.isArray(input) || input.length < 1 || input.length > rules.maxQuestions) {
+    throw problem('Add between 1 and 50 questions.');
+  }
+  const images = new Map();
+  const questions = input.map((q, index) => {
+    const label = `Question ${index + 1}: `;
+    const prompt = text(q?.prompt, rules.maxPrompt);
+    const imageId = storePicture(q?.imageData, images, label);
+    if (!prompt && !imageId) throw problem(label + 'Add a prompt or a picture.');
+    if (!Array.isArray(q?.options) || q.options.length !== rules.optionCount) {
+      throw problem(label + 'Add four answers.');
+    }
+    const options = q.options.map(option => text(option, rules.maxOption));
+    if (options.some(option => !option) || !Number.isInteger(q.correct) || !options[q.correct]) {
+      throw problem(label + 'Fill in all four answers and choose the correct one.');
+    }
+    // Existing text-only quizzes use the original 20-second, single-points rules.
+    const seconds = q.seconds ?? rules.defaultSeconds;
+    const multiplier = q.multiplier ?? rules.defaultMultiplier;
+    if (!validSeconds(seconds)) throw problem(label + 'Choose a timer of 5 to 300 whole seconds.');
+    if (!validMultiplier(multiplier)) throw problem(label + 'Use a multiplier from 0 to 10, with up to two decimal places.');
+    return { prompt, imageId, imageAlt: text(q.imageAlt, 180), options, correct: q.correct, seconds, multiplier };
+  });
+  let mediaBytes = 0;
+  for (const image of images.values()) mediaBytes += image.length;
+  if (mediaBytesInUse + mediaBytes > mediaBudget) {
+    throw problem('Picture storage is full while other games are running. Try again later.', 503);
+  }
   let code;
   do { code = String(randomInt(100000, 1000000)); } while (rooms.has(code));
-  return code;
+  const room = {
+    code, title: text(spec?.title, 60) || 'My Quiz', questions, images, mediaBytes,
+    hostToken: token(), host: null, hostTimer: null, timer: null, lobbyTimer: null, progressTimer: null,
+    status: 'lobby', questionIndex: -1, deadline: null, reveal: null, seat: 0,
+    players: new Map(), names: new Set(), answers: new Map(), pendingAnswers: new Set(),
+    standings: [], standingById: new Map()
+  };
+  mediaBytesInUse += mediaBytes;
+  rooms.set(code, room);
+  expireWithoutHost(room);
+  return room;
 }
-function publicRoom(room) {
-  const leaders = [...room.players.values()].sort((a, b) => b.score - a.score).slice(0, 10).map(({ id, name, score, color }) => ({ id, name, score, color }));
-  return { code: room.code, title: room.title, status: room.status, questionIndex: room.questionIndex, question: room.questionIndex >= 0 ? room.questions[room.questionIndex] : null,
-    questionCount: room.questions.length, players: leaders,
-    answerCount: room.answerCount || 0, totalPlayers: room.players.size, reveal: room.reveal || null, deadline: room.deadline || null };
+
+function expireWithoutHost(room) {
+  clearTimeout(room.hostTimer);
+  room.hostTimer = setTimeout(() => {
+    if (room.host || rooms.get(room.code) !== room) return;
+    clearTimeout(room.timer);
+    clearTimeout(room.progressTimer);
+    clearTimeout(room.lobbyTimer);
+    for (const player of room.players.values()) clearTimeout(player.disconnectTimer);
+    io.to(room.code).emit('room:closed');
+    io.in(room.code).socketsLeave(room.code);
+    rooms.delete(room.code);
+    mediaBytesInUse -= room.mediaBytes;
+  }, graceMs);
 }
-function publish(room) { io.to(room.code).emit('room:update', publicRoom(room)); }
-function error(socket, message) { socket.emit('app:error', message); }
-function cleanName(value) { return String(value || '').replace(/[<>\u0000-\u001f]/g, '').trim().slice(0, 18); }
-function cleanQuiz(title, questions) {
-  if (!Array.isArray(questions) || questions.length < 1 || questions.length > 50) return null;
-  const cleaned = questions.map(q => ({
-    prompt: String(q?.prompt || '').trim().slice(0, 240),
-    options: Array.isArray(q?.options) ? q.options.slice(0, 4).map(option => String(option || '').trim().slice(0, 120)) : [],
-    correct: Number(q?.correct)
-  }));
-  if (cleaned.some(q => !q.prompt || q.options.length !== 4 || q.options.some(o => !o) || !Number.isInteger(q.correct) || q.correct < 0 || q.correct > 3)) return null;
-  return { title: String(title || 'My Quiz').trim().slice(0, 60) || 'My Quiz', questions: cleaned };
-}
-function token() { return randomBytes(32).toString('hex'); }
-function stopTimer(room) { clearTimeout(room.timer); room.timer = null; }
-function finishQuestion(room) {
-  if (room.status !== 'question') return;
-  stopTimer(room); room.status = 'reveal';
+
+app.use(express.static(fileURLToPath(new URL('./public/', import.meta.url))));
+app.get('/health', (_req, res) => res.json({ ok: true, activeRooms: rooms.size, transport: 'socket.io' }));
+
+// Pictures travel once with room creation. Live events contain only a small, cacheable URL.
+app.post('/api/rooms', express.json({ limit: '14mb', inflate: false }), (req, res) => {
+  if (!req.is('application/json') || !Array.isArray(req.body?.questions)) {
+    return res.status(400).json({ error: 'Submit a quiz with a question list.' });
+  }
+  const room = createRoom(req.body);
+  res.set('Cache-Control', 'no-store').status(201).json({ code: room.code, token: room.hostToken });
+});
+app.get('/media/:code/:imageId', (req, res) => {
+  const image = rooms.get(req.params.code)?.images.get(req.params.imageId);
+  if (!image) return res.sendStatus(404);
+  res.set({
+    'Cache-Control': 'public, max-age=3600, immutable',
+    'Content-Type': 'image/jpeg',
+    'X-Content-Type-Options': 'nosniff',
+    'ETag': '"' + req.params.imageId + '"'
+  }).send(image);
+});
+app.use((err, _req, res, _next) => {
+  const status = err.status || 500;
+  let message = 'Could not create the room. Please try again.';
+  if (err.type === 'entity.too.large') message = 'This quiz upload is too large. Choose smaller pictures.';
+  else if (err.type === 'entity.parse.failed') message = 'The quiz upload could not be read.';
+  else if (status < 500 || status === 503) message = err.message;
+  res.status(status).json({ error: message });
+});
+
+function publicQuestion(room) {
   const q = room.questions[room.questionIndex];
-  room.reveal = { correct: q.correct, counts: q.options.map((_, i) => [...room.answers.values()].filter(a => a.choice === i).length) };
+  if (!q) return null;
+  return {
+    prompt: q.prompt, options: q.options, seconds: q.seconds, multiplier: q.multiplier,
+    imageUrl: q.imageId ? `/media/${room.code}/${q.imageId}` : null, imageAlt: q.imageAlt
+  };
+}
+
+function lobbySample(room) {
+  const sample = [];
+  for (const { id, name, color } of room.players.values()) {
+    sample.push({ id, name, color, score: 0 });
+    if (sample.length === rules.pageSize) break;
+  }
+  return sample;
+}
+
+function publicRoom(room) {
+  return {
+    code: room.code, title: room.title, status: room.status, questionIndex: room.questionIndex,
+    question: publicQuestion(room), questionCount: room.questions.length,
+    players: room.status === 'lobby' ? lobbySample(room) : room.standings.slice(0, rules.pageSize),
+    answerCount: room.answers.size, totalPlayers: room.players.size,
+    reveal: room.reveal, deadline: room.deadline, serverNow: Date.now()
+  };
+}
+
+function publish(room) {
+  io.to(room.code).emit('room:update', publicRoom(room));
+}
+
+function scheduleLobbyUpdate(room) {
+  if (room.lobbyTimer) return;
+  room.lobbyTimer = setTimeout(() => {
+    room.lobbyTimer = null;
+    if (room.status === 'lobby') publish(room);
+  }, 250);
+}
+
+function reportProgress(room) {
+  if (room.progressTimer) return;
+  room.progressTimer = setTimeout(() => {
+    room.progressTimer = null;
+    if (room.status === 'question' && room.host) io.to(room.host).emit('room:answer-count', room.answers.size);
+  }, 200);
+}
+
+function rankPlayers(room) {
+  const before = room.standingById;
+  const priorOrder = p => before.get(p.id)?.rank ?? p.seat;
+  const ordered = [...room.players.values()].sort((a, b) => b.score - a.score || priorOrder(a) - priorOrder(b));
+  room.standings = ordered.map((p, index) => {
+    const rank = index + 1;
+    const previousRank = before.get(p.id)?.rank ?? rank;
+    return {
+      id: p.id, name: p.name, color: p.color, score: p.score,
+      rank, previousRank, movement: previousRank - rank, roundPoints: room.answers.get(p.id)?.points ?? 0
+    };
+  });
+  room.standingById = new Map(room.standings.map(row => [row.id, row]));
+}
+
+function startQuestion(room, index) {
+  if (index === 0) rankPlayers(room);
+  room.questionIndex = index;
+  room.status = 'question';
+  room.reveal = null;
+  room.answers.clear();
+  room.pendingAnswers = new Set([...room.players.values()].filter(p => !p.expired).map(p => p.id));
+  const duration = room.questions[index].seconds * 1000;
+  room.deadline = Date.now() + duration;
+  room.timer = setTimeout(() => finishQuestion(room), duration);
   publish(room);
 }
 
+function finishQuestion(room) {
+  if (room.status !== 'question') return;
+  clearTimeout(room.timer);
+  clearTimeout(room.progressTimer);
+  room.progressTimer = null;
+  room.status = 'reveal';
+  room.deadline = null;
+  const q = room.questions[room.questionIndex];
+  const counts = q.options.map(() => 0);
+  for (const [id, answer] of room.answers) {
+    counts[answer.choice]++;
+    room.players.get(id).score += answer.points;
+  }
+  room.reveal = { correct: q.correct, counts };
+  rankPlayers(room);
+  // Each client gets its own position even outside the top ten. Sort only once per round.
+  for (const p of room.players.values()) {
+    if (p.socketId) io.to(p.socketId).emit('player:standing', {
+      code: room.code, questionIndex: room.questionIndex, row: room.standingById.get(p.id),
+      choice: room.answers.get(p.id)?.choice ?? null
+    });
+  }
+  publish(room);
+}
+
+function chooseName(room, desired) {
+  let name = desired;
+  let suffix = 2;
+  while (room.names.has(name.toLowerCase())) {
+    const tail = ' ' + suffix++;
+    name = desired.slice(0, 18 - tail.length) + tail;
+  }
+  return name;
+}
+
+function bindHost(socket, room) {
+  clearTimeout(room.hostTimer);
+  room.host = socket.id;
+  socket.join(room.code);
+  socket.data = { role: 'host', code: room.code };
+}
+
+function bindPlayer(socket, room, p) {
+  clearTimeout(p.disconnectTimer);
+  p.socketId = socket.id;
+  socket.join(room.code);
+  socket.data = { role: 'player', code: room.code, playerId: p.id };
+  socket.emit('player:joined', {
+    name: p.name, code: room.code, playerId: p.id, token: p.resumeToken,
+    answerChoice: room.answers.get(p.id)?.choice ?? null, standing: room.standingById.get(p.id) ?? null
+  });
+  socket.emit('room:update', publicRoom(room));
+}
+
+function releaseSocket(socket) {
+  const room = rooms.get(socket.data.code);
+  if (!room) { socket.data = {}; return; }
+  socket.leave(room.code);
+  const p = room.players.get(socket.data.playerId);
+  if (room.host === socket.id) {
+    room.host = null;
+    expireWithoutHost(room);
+  } else if (p?.socketId === socket.id) {
+    p.socketId = null;
+    p.disconnectTimer = setTimeout(() => {
+      if (p.socketId) return;
+      p.expired = true;
+      if (room.status === 'lobby') {
+        room.players.delete(p.id);
+        room.names.delete(p.name.toLowerCase());
+        scheduleLobbyUpdate(room);
+      } else {
+        // Keep earned scores and submitted votes even if a phone stays offline.
+        room.pendingAnswers.delete(p.id);
+        if (room.pendingAnswers.size === 0 && room.answers.size > 0) finishQuestion(room);
+      }
+    }, graceMs);
+  }
+  socket.data = {};
+}
+
 io.on('connection', socket => {
-  socket.on('room:check', ({ code } = {}) => {
-    code = String(code || '').replace(/\D/g, '').slice(0, 6);
-    const room = rooms.get(code);
-    if (!room) return error(socket, 'That room code was not found. Check it and try again.');
-    if (room.status !== 'lobby') return error(socket, 'This game has already started.');
-    socket.emit('room:check-result', { code });
+  const error = message => socket.emit('app:error', message);
+  const canJoin = value => {
+    const room = rooms.get(codeOf(value));
+    if (!room) error('That room code was not found. Check the six digits and try again.');
+    else if (room.status !== 'lobby') error('This game has already started.');
+    else if (room.players.size >= roomCapacity) error('This room is full.');
+    else return room;
+    return null;
+  };
+  const hostRoom = data => {
+    const room = rooms.get(socket.data.code);
+    return room?.host === socket.id && data?.code === room.code ? room : null;
+  };
+
+  socket.on('room:check', data => {
+    const room = canJoin(data?.code);
+    if (room) socket.emit('room:check-result', { code: room.code });
   });
 
-  socket.on('host:create', ({ title, questions } = {}) => {
-    const quiz = cleanQuiz(title, questions || demoQuiz);
-    if (!quiz) return error(socket, 'Add at least one question, with four answers and a correct answer selected.');
-    const code = makeCode();
-    const hostToken = token();
-    const room = { code, title: quiz.title, host: socket.id, hostToken, hostTimer: null, status: 'lobby', questions: quiz.questions, questionIndex: -1, players: new Map(), answers: new Map() };
-    rooms.set(code, room); socket.join(code); socket.data.role = 'host'; socket.data.code = code;
-    socket.emit('host:created', { code, title: room.title, token: hostToken }); socket.emit('room:update', publicRoom(room));
+  // Keep the existing Socket.IO creation event for earlier text-only clients.
+  socket.on('host:create', data => {
+    if (socket.data.code) return error('Finish your current room first.');
+    try {
+      const room = createRoom(data ?? {});
+      bindHost(socket, room);
+      socket.emit('host:created', { code: room.code, title: room.title, token: room.hostToken });
+      socket.emit('room:update', publicRoom(room));
+    } catch (err) { error(err.message); }
   });
 
-  socket.on('host:resume', ({ code, token: hostToken } = {}) => {
-    const room = rooms.get(String(code || ''));
-    if (!room || !hostToken || room.hostToken !== hostToken || room.status === 'finished') return socket.emit('host:resume-denied');
-    clearTimeout(room.hostTimer); room.hostTimer = null; room.host = socket.id;
-    socket.join(room.code); socket.data.role = 'host'; socket.data.code = room.code;
-    socket.emit('host:resumed', { code: room.code, title: room.title }); socket.emit('room:update', publicRoom(room));
-  });
-
-  socket.on('player:join', ({ code, name } = {}) => {
-    code = String(code || '').replace(/\D/g, '').slice(0, 6); name = cleanName(name);
-    const room = rooms.get(code);
-    if (!room) return error(socket, 'That room code was not found. Check it and try again.');
-    if (room.status !== 'lobby') return error(socket, 'This game has already started.');
-    if (!name) return error(socket, 'Choose a nickname to join.');
-    if (room.players.size >= 2500) return error(socket, 'This room has reached its player limit.');
-    if ([...room.players.values()].some(p => p.name.toLowerCase() === name.toLowerCase())) name = `${name.slice(0, 14)} ${randomInt(10, 100)}`;
-    const playerId = randomBytes(12).toString('hex'); const resumeToken = token();
-    const player = { id: playerId, name, score: 0, color: colors[room.players.size % colors.length], resumeToken, socketId: socket.id, disconnectTimer: null };
-    room.players.set(playerId, player); socket.join(code); socket.data.role = 'player'; socket.data.code = code; socket.data.playerId = playerId;
-    socket.emit('player:joined', { name, code, playerId, token: resumeToken, answerChoice: null }); socket.emit('room:update', publicRoom(room));
-    if (room.host) io.to(room.host).emit('room:player-joined', { name, totalPlayers: room.players.size });
-  });
-
-  socket.on('player:resume', ({ code, playerId, token: resumeToken } = {}) => {
-    const room = rooms.get(String(code || ''));
-    const player = room?.players.get(String(playerId || ''));
-    if (!room || !player || !resumeToken || player.resumeToken !== resumeToken || room.status === 'finished') return socket.emit('player:resume-denied');
-    clearTimeout(player.disconnectTimer); player.disconnectTimer = null; player.socketId = socket.id;
-    socket.join(room.code); socket.data.role = 'player'; socket.data.code = room.code; socket.data.playerId = player.id;
-    const answerChoice = room.answers.get(player.id)?.choice ?? null;
-    socket.emit('player:joined', { name: player.name, code: room.code, playerId: player.id, token: player.resumeToken, answerChoice });
+  socket.on('host:resume', data => {
+    const room = rooms.get(codeOf(data?.code));
+    if (!room || room.hostToken !== data?.token) return socket.emit('host:resume-denied');
+    if (socket.data.code && socket.data.code !== room.code) releaseSocket(socket);
+    bindHost(socket, room);
+    socket.emit('host:resumed', { code: room.code, title: room.title });
     socket.emit('room:update', publicRoom(room));
   });
 
-  socket.on('host:start', ({ code } = {}) => {
-    const room = rooms.get(String(code));
-    if (!room || room.host !== socket.id || room.status !== 'lobby') return error(socket, 'This game cannot be started.');
-    room.questionIndex = 0; room.status = 'question'; room.answers.clear(); room.answerCount = 0;
-    room.deadline = Date.now() + 20000; room.timer = setTimeout(() => finishQuestion(room), 20000); publish(room);
+  socket.on('player:join', data => {
+    if (socket.data.code) return error('You already have a place in a room.');
+    const room = canJoin(data?.code);
+    if (!room) return;
+    const desired = text(data?.name, 18).replace(/[<>\u0000-\u001f]/g, '').trim();
+    if (!desired) return error('Choose a nickname to join.');
+    const name = chooseName(room, desired);
+    const p = {
+      id: randomBytes(12).toString('hex'), name, score: 0, seat: ++room.seat,
+      color: colors[(room.seat - 1) % colors.length], resumeToken: token(), expired: false
+    };
+    room.players.set(p.id, p);
+    room.names.add(name.toLowerCase());
+    bindPlayer(socket, room, p);
+    scheduleLobbyUpdate(room);
   });
 
-  socket.on('player:answer', ({ choice } = {}) => {
+  socket.on('player:resume', data => {
+    const room = rooms.get(codeOf(data?.code));
+    const p = room?.players.get(data?.playerId);
+    if (!p || p.expired || p.resumeToken !== data?.token) return socket.emit('player:resume-denied');
+    if (socket.data.code && socket.data.code !== room.code) releaseSocket(socket);
+    bindPlayer(socket, room, p);
+  });
+
+  socket.on('host:start', data => {
+    const room = hostRoom(data);
+    if (room?.status !== 'lobby') return error('This game cannot be started.');
+    startQuestion(room, 0);
+  });
+
+  socket.on('player:answer', (data, ack) => {
+    const reply = result => { if (typeof ack === 'function') ack(result); };
     const room = rooms.get(socket.data.code);
-    const playerId = socket.data.playerId;
-    if (!room || socket.data.role !== 'player' || room.players.get(playerId)?.socketId !== socket.id || room.status !== 'question' || room.answers.has(playerId)) return;
-    choice = Number(choice);
-    if (!Number.isInteger(choice) || choice < 0 || choice > 3) return;
-    const elapsed = Math.max(0, Date.now() - (room.deadline - 20000));
-    const correct = choice === room.questions[room.questionIndex].correct;
-    const points = correct ? Math.max(500, Math.round(1000 * (1 - elapsed / 40000))) : 0;
-    room.answers.set(playerId, { choice, correct });
-    const player = room.players.get(playerId); if (player) player.score += points;
-    room.answerCount = room.answers.size;
-    if (room.host) io.to(room.host).emit('room:answer-count', room.answerCount);
-    if (room.answerCount === room.players.size && room.players.size > 0) finishQuestion(room);
+    const p = room?.players.get(socket.data.playerId);
+    if (!p || p.socketId !== socket.id || room.status !== 'question' ||
+        (data?.questionIndex !== undefined && data.questionIndex !== room.questionIndex)) {
+      return reply({ ok: false, message: 'This question is no longer open.' });
+    }
+    const now = Date.now();
+    if (now >= room.deadline) {
+      reply({ ok: false, message: 'Time is up.' });
+      return finishQuestion(room);
+    }
+    const previous = room.answers.get(p.id);
+    if (previous) return reply({ ok: true, choice: previous.choice });
+    const choice = data?.choice;
+    if (!Number.isInteger(choice) || choice < 0 || choice >= rules.optionCount) {
+      return reply({ ok: false, message: 'Choose one of the four answers.' });
+    }
+    const q = room.questions[room.questionIndex];
+    const fractionLeft = Math.min(1, (room.deadline - now) / (q.seconds * 1000));
+    const base = Math.round(500 + 500 * fractionLeft);
+    const points = choice === q.correct ? Math.round(base * q.multiplier) : 0;
+    room.answers.set(p.id, { choice, points });
+    room.pendingAnswers.delete(p.id);
+    reply({ ok: true, choice });
+    if (room.pendingAnswers.size === 0) finishQuestion(room);
+    else reportProgress(room);
   });
 
-  socket.on('host:next', ({ code } = {}) => {
-    const room = rooms.get(String(code));
-    if (!room || room.host !== socket.id || room.status !== 'reveal') return error(socket, 'Wait for the question results first.');
-    if (room.questionIndex + 1 >= room.questions.length) { room.status = 'finished'; room.reveal = null; publish(room); return; }
-    room.questionIndex++; room.status = 'question'; room.reveal = null; room.answers.clear(); room.answerCount = 0;
-    room.deadline = Date.now() + 20000; room.timer = setTimeout(() => finishQuestion(room), 20000); publish(room);
-  });
-
-  socket.on('host:force-reveal', ({ code } = {}) => {
-    const room = rooms.get(String(code));
-    if (!room || room.host !== socket.id) return error(socket, 'Only the host can reveal answers.');
+  socket.on('host:force-reveal', data => {
+    const room = hostRoom(data);
+    if (!room) return error('Only the host can reveal answers.');
     finishQuestion(room);
   });
-
-  socket.on('disconnect', () => {
-    const room = rooms.get(socket.data.code); if (!room) return;
-    if (room.host === socket.id) {
-      room.host = null;
-      room.hostTimer = setTimeout(() => { if (!room.host && rooms.has(room.code)) { stopTimer(room); io.to(room.code).emit('room:closed'); rooms.delete(room.code); } }, RECONNECT_GRACE_MS);
-      return;
-    }
-    const roomPlayer = room.players.get(socket.data.playerId);
-    if (roomPlayer?.socketId === socket.id) {
-      roomPlayer.socketId = null;
-      roomPlayer.disconnectTimer = setTimeout(() => {
-        if (!roomPlayer.socketId && room.players.delete(roomPlayer.id)) {
-          room.answers.delete(roomPlayer.id);
-          if (room.host) io.to(room.host).emit('room:player-count', room.players.size);
-        }
-      }, RECONNECT_GRACE_MS);
-    }
+  socket.on('host:next', data => {
+    const room = hostRoom(data);
+    if (room?.status !== 'reveal') return error('Wait for the round results first.');
+    if (room.questionIndex + 1 < room.questions.length) return startQuestion(room, room.questionIndex + 1);
+    room.status = 'finished';
+    publish(room);
   });
+
+  socket.on('room:standings-page', (data, ack) => {
+    if (typeof ack !== 'function') return;
+    const room = rooms.get(socket.data.code);
+    if (!room || !['reveal', 'finished'].includes(room.status) || data?.questionIndex !== room.questionIndex) {
+      return ack({ ok: false });
+    }
+    const offset = data.offset;
+    if (!Number.isInteger(offset) || offset < 0 || offset >= room.standings.length) return ack({ ok: false });
+    ack({ ok: true, offset, rows: room.standings.slice(offset, offset + rules.pageSize) });
+  });
+  socket.on('room:leave', () => releaseSocket(socket));
+  socket.on('disconnect', () => releaseSocket(socket));
 });
 
-httpServer.listen(PORT, '0.0.0.0', () => console.log(`Quiz Night listening on http://localhost:${PORT}`));
+const port = Number(process.env.PORT || 3000);
+server.listen(port, '0.0.0.0', () => console.log(`Quiz Night listening on http://localhost:${port}`));
