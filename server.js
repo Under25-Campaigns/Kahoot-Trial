@@ -3,7 +3,9 @@ import { createServer } from 'node:http';
 import { Server } from 'socket.io';
 import { createHash, randomBytes, randomInt } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+import { networkInterfaces } from 'node:os';
 import { quizRules as rules, validMultiplier, validSeconds } from './public/quiz-rules.js';
+import { isLocalOnlyHost } from './public/room-links.js';
 
 const app = express();
 const server = createServer(app);
@@ -125,6 +127,19 @@ app.post('/api/rooms', express.json({ limit: '14mb', inflate: false }), (req, re
   }
   const room = createRoom(req.body);
   res.set('Cache-Control', 'no-store').status(201).json({ code: room.code, token: room.hostToken });
+});
+// The host can export the questionnaire after a refresh, including pictures from later rounds.
+app.get('/api/rooms/:code/quiz', (req, res) => {
+  res.set('Cache-Control', 'private, no-store');
+  const room = rooms.get(req.params.code);
+  if (!room || req.get('Authorization') !== 'Bearer ' + room.hostToken) {
+    return res.status(404).json({ error: 'Quiz file unavailable.' });
+  }
+  const questions = room.questions.map(({ prompt, options, correct, seconds, multiplier, imageId, imageAlt }) => ({
+    prompt, options, correct, seconds, multiplier, imageAlt,
+    imageData: imageId ? 'data:image/jpeg;base64,' + room.images.get(imageId).toString('base64') : null
+  }));
+  res.json({ title: room.title, questions });
 });
 app.get('/media/:code/:imageId', (req, res) => {
   const image = rooms.get(req.params.code)?.images.get(req.params.imageId);
@@ -263,6 +278,31 @@ function bindHost(socket, room) {
   socket.data = { role: 'host', code: room.code };
 }
 
+function hostLobbyDetails(socket, room) {
+  const details = { code: room.code, title: room.title };
+  // Only a host connecting locally needs the machine's other addresses.
+  if (!isLocalOnlyHost(socket.handshake.address || '')) return details;
+  const headers = socket.handshake.headers;
+  if (headers.forwarded || headers['x-forwarded-for'] || headers['x-forwarded-host']) return details;
+  let hostname;
+  try { hostname = new URL('http://' + headers.host).hostname; }
+  catch { return details; }
+  if (!isLocalOnlyHost(hostname)) return details;
+  let interfaces;
+  try { interfaces = Object.entries(networkInterfaces()); }
+  catch { return details; } // Hosts can enter the Wi-Fi URL if the OS hides its interfaces.
+  // Prefer physical Wi-Fi and Ethernet interfaces when a VPN or virtual adapter is also active.
+  const physical = name => /^(en\d|eth\d|enp|ens|wlan|wlp|wi-?fi|ethernet)/i.test(name);
+  interfaces.sort(([a], [b]) => Number(physical(b)) - Number(physical(a)));
+  const addresses = new Set();
+  for (const [, records] of interfaces) {
+    for (const record of records || []) {
+      if (record.family === 'IPv4' && !record.internal && !isLocalOnlyHost(record.address)) addresses.add(record.address);
+    }
+  }
+  return { ...details, lanAddresses: [...addresses] };
+}
+
 function bindPlayer(socket, room, p) {
   clearTimeout(p.disconnectTimer);
   p.socketId = socket.id;
@@ -304,11 +344,11 @@ function releaseSocket(socket) {
 
 io.on('connection', socket => {
   const error = message => socket.emit('app:error', message);
-  const canJoin = value => {
+  const canJoin = (value, report = error) => {
     const room = rooms.get(codeOf(value));
-    if (!room) error('That room code was not found. Check the six digits and try again.');
-    else if (room.status !== 'lobby') error('This game has already started.');
-    else if (room.players.size >= roomCapacity) error('This room is full.');
+    if (!room) report('That room code was not found. Check the six digits and try again.');
+    else if (room.status !== 'lobby') report('This game has already started.');
+    else if (room.players.size >= roomCapacity) report('This room is full.');
     else return room;
     return null;
   };
@@ -317,9 +357,12 @@ io.on('connection', socket => {
     return room?.host === socket.id && data?.code === room.code ? room : null;
   };
 
-  socket.on('room:check', data => {
-    const room = canJoin(data?.code);
-    if (room) socket.emit('room:check-result', { code: room.code });
+  socket.on('room:check', (data, ack) => {
+    const replies = typeof ack === 'function';
+    const room = canJoin(data?.code, replies ? message => ack({ ok: false, message }) : error);
+    if (!room) return;
+    if (replies) ack({ ok: true, code: room.code });
+    else socket.emit('room:check-result', { code: room.code });
   });
 
   // Keep the existing Socket.IO creation event for earlier text-only clients.
@@ -328,7 +371,7 @@ io.on('connection', socket => {
     try {
       const room = createRoom(data ?? {});
       bindHost(socket, room);
-      socket.emit('host:created', { code: room.code, title: room.title, token: room.hostToken });
+      socket.emit('host:created', { ...hostLobbyDetails(socket, room), token: room.hostToken });
       socket.emit('room:update', publicRoom(room));
     } catch (err) { error(err.message); }
   });
@@ -338,7 +381,7 @@ io.on('connection', socket => {
     if (!room || room.hostToken !== data?.token) return socket.emit('host:resume-denied');
     if (socket.data.code && socket.data.code !== room.code) releaseSocket(socket);
     bindHost(socket, room);
-    socket.emit('host:resumed', { code: room.code, title: room.title });
+    socket.emit('host:resumed', hostLobbyDetails(socket, room));
     socket.emit('room:update', publicRoom(room));
   });
 

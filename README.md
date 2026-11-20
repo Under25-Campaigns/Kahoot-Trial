@@ -30,6 +30,24 @@ Each quiz supports up to 50 questions. Each question has its own settings.
 
 Select **Create room**, share the code and choose **Start the quiz** when players have joined.
 
+## Invite players with a QR code
+
+Create a room and select **Project QR code** in the host lobby. Players scan the code with their phone camera, open the link, enter a nickname and join. The projector shows the six-digit code for anyone joining manually, plus a live player count. Select **Back to lobby** or press Escape when you are ready to start.
+
+Choose **Download QR** for a PNG you can put on a slide or send to players. You can also share the join link displayed below the QR code. Each room gets its own invite. Creating another room from a saved quiz generates a new invite.
+
+On a public website, the QR links to that site. If you host from `localhost` on your Mac, connect the phones to the same Wi-Fi. The lobby looks for your Mac’s network address automatically. If needed, open **Wi-Fi join address**, enter the address reachable from a phone (for example `http://192.168.1.10:3000`), and select **Update QR**.
+
+## Save a quiz and host it again
+
+Select **Save quiz** in the builder at any time, including while a question is unfinished. The **Saved in My quizzes** message confirms the save. You can close the tab, return to the same site in the same browser, and choose **My quizzes → Open quiz**. Save again after editing to update that copy. Choosing **Create room** also saves the questionnaire and opens a fresh game with a new room code and fresh scores.
+
+The save keeps the quiz name, question order, prompts, all answer choices, correct answers, timers, point multipliers, pictures and picture descriptions. You can reuse it after a live room ends or the server restarts.
+
+For a backup or another device, select **Download quiz file** in the builder or the host’s lobby or results screen. The resulting `.quiz.json` file includes the pictures and answer key. Open **My quizzes → Import quiz file** on the other device, choose the file, and you can edit or host it. Each import creates a separate copy on that device.
+
+My quizzes uses this browser’s storage for this website. Clearing site data or ending a private browsing session can erase those copies. A downloaded quiz file remains available separately. If browser storage is unavailable, you can still download, import and host a quiz.
+
 ## Play and scoring
 
 The round closes when everyone has answered, time runs out, or the host selects **Reveal answers**. Correct answers earn 500 to 1,000 base points according to how quickly the player answers. The server multiplies that amount by the question’s multiplier and rounds to a whole point. Skipped and incorrect answers earn zero.
