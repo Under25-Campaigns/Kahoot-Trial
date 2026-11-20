@@ -1,5 +1,7 @@
 import { quizRules as rules, validMultiplier, validSeconds } from './quiz-rules.js';
 import { escapeHtml } from './html.js';
+import { saveQuiz } from './saved-quizzes.js';
+import { downloadQuiz } from './quiz-files.js';
 
 function newQuestion() {
   return {
@@ -65,16 +67,48 @@ function questionError(q) {
   return null;
 }
 
-export function openBuilder(root, onBack, onCreate) {
-  const draft = { title: 'My Quiz', questions: [newQuestion()] };
+export function openBuilder(root, onBack, onCreate, entry = null) {
+  const draft = entry ? {
+    title: entry.quiz.title,
+    questions: entry.quiz.questions.map(q => ({
+      ...newQuestion(), ...q, options: [...q.options], imageData: q.imageData || '',
+      seconds: String(q.seconds), multiplier: String(q.multiplier)
+    }))
+  } : { title: 'My Quiz', questions: [newQuestion()] };
   let current = 0;
-  let creating = false;
+  let saved = entry?.summary || null;
+  let form;
+  let busy = '';
   let errorText = '';
+  let feedback = entry?.message || (saved ? 'Saved in My quizzes.' : '');
+
+  function edited() {
+    feedback = 'Unsaved changes';
+    const status = form?.querySelector('#save-feedback');
+    if (status && status.textContent !== feedback) status.textContent = feedback;
+  }
+
+  function snapshot() {
+    const numberOrBlank = value => value.trim() === '' ? '' : Number(value);
+    return {
+      title: draft.title,
+      questions: draft.questions.map(q => ({
+        prompt: q.prompt, options: [...q.options], correct: q.correct,
+        seconds: numberOrBlank(q.seconds), multiplier: numberOrBlank(q.multiplier),
+        imageData: q.imageData || null, imageAlt: q.imageAlt
+      }))
+    };
+  }
+
+  async function keep(quiz) {
+    saved = await saveQuiz(quiz, saved);
+    feedback = 'Saved in My quizzes.';
+  }
 
   function pictureMarkup(q) {
     const caption = q.imageData ? 'Replace picture' : 'Add picture';
     return `
-      ${q.imageData ? `<figure class="builder-preview"><img src="${q.imageData}" alt="Question picture preview"></figure>` : ''}
+      ${q.imageData ? `<figure class="builder-preview"><img src="${escapeHtml(q.imageData)}" alt="Question picture preview"></figure>` : ''}
       <div class="picture-controls">
         <label class="file-pick"><span aria-hidden="true">＋</span> ${caption}
           <input type="file" id="picture-input" aria-label="${caption}" accept="image/jpeg,image/png,image/webp">
@@ -89,8 +123,8 @@ export function openBuilder(root, onBack, onCreate) {
   }
 
   function updatePicture(q) {
-    if (draft.questions[current] !== q) return;
-    const area = root.querySelector('#question-media');
+    if (draft.questions[current] !== q || !form?.isConnected) return;
+    const area = form.querySelector('#question-media');
     if (area) area.innerHTML = pictureMarkup(q);
   }
 
@@ -101,7 +135,7 @@ export function openBuilder(root, onBack, onCreate) {
     updatePicture(q);
     try {
       const image = await preparePicture(file);
-      if (q.pictureJob === job) q.imageData = image;
+      if (q.pictureJob === job) { q.imageData = image; edited(); }
     } catch (err) {
       if (q.pictureJob === job) {
         q.pictureError = err instanceof DOMException ? 'Could not open this picture. Choose a JPG, PNG or WebP file.' : err.message;
@@ -122,28 +156,35 @@ export function openBuilder(root, onBack, onCreate) {
     else if (input.dataset.field) q[input.dataset.field] = input.value;
     else if (input.dataset.option !== undefined) q.options[Number(input.dataset.option)] = input.value;
     else if (input.id === 'correct-answer') q.correct = Number(input.value);
+    else return;
+    edited();
   }
 
   function handleButton(event) {
     const button = event.target.closest('[data-builder]');
-    if (!button || creating) return;
+    if (!button || busy) return;
     errorText = '';
     switch (button.dataset.builder) {
       case 'back': return onBack();
+      case 'save': return perform('save');
+      case 'download': return perform('download');
       case 'select': current = Number(button.dataset.index); break;
       case 'add':
         if (draft.questions.length >= rules.maxQuestions) return;
         draft.questions.push(newQuestion());
         current = draft.questions.length - 1;
+        edited();
         break;
       case 'remove':
         if (draft.questions.length === 1) return;
         draft.questions.splice(current, 1);
         current = Math.min(current, draft.questions.length - 1);
+        edited();
         break;
       case 'remove-picture': {
         const q = draft.questions[current];
         Object.assign(q, { imageData: '', imageAlt: '', pictureJob: null, pictureError: '' });
+        edited();
         return updatePicture(q);
       }
       default: return;
@@ -151,11 +192,10 @@ export function openBuilder(root, onBack, onCreate) {
     render();
   }
 
-  async function submit(event) {
-    event.preventDefault();
-    if (creating) return;
+  async function perform(action) {
+    if (busy) return;
     for (const [index, q] of draft.questions.entries()) {
-      const issue = questionError(q);
+      const issue = action === 'host' || q.pictureJob ? questionError(q) : null;
       if (issue) {
         current = index;
         errorText = `Question ${index + 1}: ${issue[0]}`;
@@ -164,23 +204,31 @@ export function openBuilder(root, onBack, onCreate) {
         return;
       }
     }
-    creating = true;
+    busy = action;
     errorText = '';
     render();
+    const quiz = snapshot();
     try {
-      await onCreate({
-        title: draft.title.trim() || 'My Quiz',
-        questions: draft.questions.map(q => ({
-          prompt: q.prompt.trim(), options: q.options.map(option => option.trim()), correct: q.correct,
-          seconds: Number(q.seconds), multiplier: Number(q.multiplier),
-          imageData: q.imageData || null, imageAlt: q.imageAlt.trim()
-        }))
-      });
+      if (action === 'download') {
+        downloadQuiz(quiz);
+        feedback = 'Quiz file download started.';
+      } else if (action === 'save') {
+        await keep(quiz);
+      } else {
+        let saveWarning = '';
+        try { await keep(quiz); }
+        catch (err) {
+          saveWarning = err.message + ' Use Download quiz file to keep these questions.';
+          feedback = saveWarning;
+        }
+        await onCreate(quiz, saveWarning);
+        return;
+      }
     } catch (err) {
-      creating = false;
-      errorText = err.message;
-      render();
+      errorText = action === 'save' ? err.message + ' You can download a quiz file instead.' : err.message;
     }
+    busy = '';
+    render();
   }
 
   function render() {
@@ -190,7 +238,7 @@ export function openBuilder(root, onBack, onCreate) {
         aria-label="Edit question ${i + 1}" aria-pressed="${i === current}">${i + 1}</button>`).join('');
     root.innerHTML = `
       <section class="join-wrap builder-wrap"><form class="builder-card" id="builder-form" novalidate>
-        <fieldset class="builder-fields" ${creating ? 'disabled' : ''}>
+        <fieldset class="builder-fields" ${busy ? 'disabled' : ''}>
           <button type="button" class="back" data-builder="back">← Back</button>
           <h1 class="builder-title">Make a quiz</h1>
           <label class="field-label" for="quiz-title">Quiz name</label>
@@ -227,15 +275,19 @@ export function openBuilder(root, onBack, onCreate) {
             </label>
           </div>
           <p class="form-error" role="alert">${escapeHtml(errorText)}</p>
-          <div class="builder-actions"><span class="field-help">${draft.questions.length} question${draft.questions.length === 1 ? '' : 's'}</span>
-            <button type="submit" class="btn btn-dark">${creating ? 'Creating room…' : 'Create room →'}</button></div>
+          <div class="builder-actions save-actions">
+            <button type="button" class="btn btn-light" data-builder="save">${busy === 'save' ? 'Saving…' : 'Save quiz'}</button>
+            <button type="button" class="text-btn" data-builder="download">Download quiz file</button>
+            <button type="submit" class="btn btn-dark">${busy === 'host' ? 'Creating room…' : 'Create room →'}</button>
+          </div>
+          <p class="save-feedback" id="save-feedback" role="status">${escapeHtml(feedback)}</p>
         </fieldset>
       </form></section>`;
-    const form = root.querySelector('form');
+    form = root.querySelector('form');
     form.addEventListener('input', changeField);
     form.addEventListener('change', changeField);
     form.addEventListener('click', handleButton);
-    form.addEventListener('submit', submit);
+    form.addEventListener('submit', event => { event.preventDefault(); void perform('host'); });
   }
   render();
 }

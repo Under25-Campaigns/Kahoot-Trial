@@ -1,14 +1,22 @@
 import { escapeHtml as esc } from './html.js';
 import { openBuilder } from './builder.js';
+import { openQuizShelf } from './quiz-shelf.js';
+import { downloadQuiz } from './quiz-files.js';
 import { standingsMarkup, winnerMarkup, celebrateWinner } from './standings.js';
 import { quizRules } from './quiz-rules.js';
+import { mountRoomInvite } from './room-invite.js';
 
 const socket = window.io({ autoConnect: false });
 const app = document.querySelector('#app');
 const toast = document.querySelector('#toast');
 const sessionKey = 'quizNightSession';
-let role = null, session = readSession(), screen = session ? 'resuming' : 'home';
-let room = null, joinCode = '', myName = '', playerId = null, choice = null, pendingChoice = null;
+let role = null, session = readSession();
+let invitation = new URL(location.href).searchParams.get('room');
+let joinCode = /^\d{6}$/.test(invitation || '') ? invitation : '';
+let screen = session ? 'resuming' : 'home';
+if (invitation !== null && session?.code !== joinCode) screen = joinCode ? 'join-invite' : 'join-code';
+let room = null, myName = '', playerId = null, choice = null, pendingChoice = null;
+let hostInvite = null, lanAddresses = [], checkRequest = 0;
 let restoring = false, personal = null, clockEnd = 0, clockInterval = null, toastTimer = null;
 let page = { offset: 0, rows: null }, lastScene = '', celebrated = '', pageRequest = 0;
 
@@ -41,6 +49,32 @@ function resume() {
   if (session && socket.connected) socket.emit(session.role === 'host' ? 'host:resume' : 'player:resume', session);
 }
 
+function clearInvitation() {
+  if (invitation === null) return;
+  invitation = null;
+  const url = new URL(location.href);
+  url.searchParams.delete('room');
+  try { history.replaceState(history.state, '', url.pathname + url.search + url.hash); }
+  catch { /* A saved session can still resume when the browser restricts history changes. */ }
+}
+
+function checkRoom(code) {
+  if (!socket.connected) return;
+  const request = ++checkRequest;
+  const submit = app.querySelector('[data-form="code"] .wide');
+  if (submit) submit.disabled = true;
+  socket.timeout(8000).emit('room:check', { code }, (err, reply) => {
+    if (request !== checkRequest || !['join-code', 'join-invite'].includes(screen)) return;
+    if (err && !socket.connected && screen === 'join-invite') return; // Recheck on reconnect.
+    if (err || !reply?.ok) {
+      show('join-code', reply?.message || 'Could not reach the room. Check your connection and try again.');
+      return;
+    }
+    joinCode = reply.code;
+    show('join-name');
+  });
+}
+
 function notify(message) {
   toast.textContent = message;
   toast.classList.add('show');
@@ -49,20 +83,35 @@ function notify(message) {
 }
 
 function home() {
+  const returnToSession = session && !room && !role && ['join-invite', 'join-code', 'join-name'].includes(screen);
+  clearInvitation();
+  checkRequest++;
+  hostInvite?.destroy();
+  hostInvite = null;
+  lanAddresses = [];
   if (room && socket.connected) socket.emit('room:leave');
   clearInterval(clockInterval);
   role = null; room = null; joinCode = ''; myName = ''; playerId = null;
   choice = null; pendingChoice = null; personal = null; restoring = false;
   page = { offset: 0, rows: null }; lastScene = ''; celebrated = ''; pageRequest++;
+  if (returnToSession) { show('resuming'); resume(); return; }
   storeSession(null);
   show('home');
 }
 
-function show(view) {
+function show(view, entry = null) {
   screen = view;
-  if (view === 'builder') { openBuilder(app, home, createQuiz); return; }
+  if (view === 'builder') {
+    return openBuilder(app, entry ? () => show('saved') : home, createQuiz, entry);
+  }
+  if (view === 'saved') return openQuizShelf(app, saved => show('builder', saved));
   if (view === 'resuming') {
     app.innerHTML = '<section class="join-wrap"><div class="join-card"><h2>Opening your room…</h2></div></section>';
+    return;
+  }
+  if (view === 'join-invite') {
+    app.innerHTML = `<section class="join-wrap"><div class="join-card"><h2>Opening room ${esc(joinCode)}…</h2>
+      <button class="back" data-action="join">Enter a different code</button></div></section>`;
     return;
   }
   if (view === 'home') {
@@ -70,7 +119,8 @@ function show(view) {
       <h1>Bring your<br>people. <em>Play.</em></h1>
       <p class="intro">Host a live quiz or join one with a room code.</p>
       <div class="buttons"><button class="btn btn-dark" data-action="create">Create a quiz ↗</button>
-        <button class="btn btn-light" data-action="join">I have a code</button></div></div>
+        <button class="btn btn-light" data-action="join">I have a code</button></div>
+      <button class="text-btn saved-home-link" data-action="saved">My quizzes →</button></div>
       <div class="art" aria-hidden="true"><div class="blob"></div><div class="floating float-a">⚡ +850 points</div>
         <div class="quiz-card"><div class="card-top"><span>QUESTION 02 / 10</span><span class="pill">00:18</span></div>
           <div class="card-title">What makes a great game?</div>
@@ -85,6 +135,7 @@ function show(view) {
       <label class="field-label" for="room-code">Room code</label>
       <input class="field code-input" id="room-code" inputmode="numeric" maxlength="6" pattern="[0-9]{6}"
         autocomplete="one-time-code" placeholder="000000" value="${esc(joinCode)}" required>
+      <p class="form-error" role="alert">${esc(entry || '')}</p>
       <button class="btn btn-dark wide">Continue →</button></form></section>`;
     app.querySelector('input').focus();
     return;
@@ -95,12 +146,13 @@ function show(view) {
       <div class="eyebrow">Room ${esc(joinCode)}</div><h2>Pick a nickname</h2>
       <label class="field-label" for="nickname">Your nickname</label>
       <input class="field" id="nickname" maxlength="18" autocomplete="nickname" required>
+      <p class="form-error" role="alert"></p>
       <button class="btn btn-dark wide">Let’s play →</button></form></section>`;
     app.querySelector('input').focus();
   }
 }
 
-async function createQuiz(quiz) {
+async function createQuiz(quiz, saveWarning) {
   const response = await fetch('/api/rooms', {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(quiz)
   });
@@ -108,7 +160,7 @@ async function createQuiz(quiz) {
   if (!response.ok || !result.code || !result.token) {
     throw new Error(result.error || 'The room could not be created. Please try again.');
   }
-  storeSession({ role: 'host', code: result.code, token: result.token });
+  storeSession({ role: 'host', code: result.code, token: result.token, quizSaved: !saveWarning, saveWarning });
   show('resuming');
   resume();
 }
@@ -125,18 +177,40 @@ function questionTitle(q) {
 
 function roomHeader() {
   return `<div class="game-head"><div class="game-brand">✳ ${esc(room.title)}</div>
-    <div class="room-code"><small>ROOM CODE</small><strong>${esc(room.code)}</strong></div></div>`;
+    <div class="room-code"><small>ROOM CODE</small><strong>${esc(room.code)}</strong></div></div>
+    ${role === 'host' && ['lobby', 'finished'].includes(room.status) ? `<div class="host-quiz-copy">
+      <span>${esc(session?.saveWarning || (session?.quizSaved ? 'Saved in My quizzes.' : ''))}</span>
+      <button type="button" class="text-btn" data-action="download-room">Download quiz file</button>
+    </div>` : ''}`;
+}
+
+async function downloadRoomQuiz(button) {
+  if (role !== 'host' || !room || !session?.token) return;
+  button.disabled = true;
+  try {
+    const response = await fetch('/api/rooms/' + room.code + '/quiz', {
+      headers: { Authorization: 'Bearer ' + session.token }, cache: 'no-store'
+    });
+    if (!response.ok) throw new Error('Could not download the quiz. Reopen it from My quizzes or try again.');
+    downloadQuiz(await response.json());
+  } catch (err) { notify(err.message); }
+  finally { button.disabled = false; }
+}
+
+function lobbyNames() {
+  return room.players.map(p => `<span class="avatar-chip">${esc(p.name)}</span>`).join('');
 }
 
 function lobbyView() {
-  const people = room.players.map(p => `<span class="avatar-chip">${esc(p.name)}</span>`).join('');
-  return `<section class="game-panel center"><span class="status-badge">Room open</span>
+  const lobby = `<section class="game-panel center lobby-panel"><span class="status-badge">Room open</span>
     <h2>${role === 'host' ? 'Ready to play?' : `You’re in, ${esc(myName)}!`}</h2>
-    <p class="subtle">${role === 'host' ? 'Share the room code with your players.' : 'Your host will start the quiz.'}</p>
+    <p class="subtle">${role === 'host' ? 'Start when your players are ready.' : 'Your host will start the quiz.'}</p>
     <div class="player-count">${room.totalPlayers.toLocaleString()}</div><div class="subtle">players joined</div>
-    <div class="avatars">${people}</div>
+    <div class="avatars">${lobbyNames()}</div>
     ${role === 'host' ? '<button class="btn btn-dark" data-action="start">Start the quiz →</button>' : ''}
   </section>`;
+  return role === 'host' ? `<div class="host-lobby">${lobby}
+    <section class="game-panel invite-card" id="room-invite" aria-labelledby="invite-title"></section></div>` : lobby;
 }
 
 function secondsLeft() {
@@ -203,6 +277,14 @@ function renderRoom() {
   const scene = room.code + '/' + room.questionIndex + '/' + room.status;
   const fresh = lastScene !== scene;
   lastScene = scene;
+  if (!fresh && room.status === 'lobby' && app.querySelector('.lobby-panel')) {
+    app.querySelector('.player-count').textContent = room.totalPlayers.toLocaleString();
+    app.querySelector('.avatars').innerHTML = lobbyNames();
+    hostInvite?.setCount(room.totalPlayers);
+    return;
+  }
+  hostInvite?.destroy();
+  hostInvite = null;
   if (fresh) {
     page = { offset: 0, rows: null };
     pageRequest++;
@@ -223,6 +305,10 @@ function renderRoom() {
       <div class="round-actions"><button class="btn btn-dark" data-action="home">Back to home</button></div>`;
   }
   app.innerHTML = `<section class="game-shell">${roomHeader()}${view}</section>`;
+  if (role === 'host' && room.status === 'lobby') {
+    hostInvite = mountRoomInvite(app.querySelector('#room-invite'), room, lanAddresses, session?.inviteOrigin,
+      origin => storeSession({ ...session, inviteOrigin: origin }));
+  }
   if (room.status === 'finished' && room.players.length && celebrated !== room.code) {
     celebrated = room.code;
     celebrateWinner(app.querySelector('.winner-card'));
@@ -287,8 +373,13 @@ app.addEventListener('click', event => {
   if (!button || button.disabled) return;
   switch (button.dataset.action) {
     case 'home': return home();
+    case 'saved': return show('saved');
+    case 'download-room': return downloadRoomQuiz(button);
     case 'create': return show('builder');
-    case 'join': return show('join-code');
+    case 'join':
+      checkRequest++;
+      clearInvitation();
+      return show('join-code');
     case 'answer': return submitAnswer(Number(button.dataset.choice));
     case 'prev-page': return changePage(-1);
     case 'next-page': return changePage(1);
@@ -310,7 +401,7 @@ app.addEventListener('submit', event => {
   if (!socket.connected) return notify('Waiting for a connection. Try again in a moment.');
   if (kind === 'code') {
     joinCode = app.querySelector('#room-code').value.trim();
-    return socket.emit('room:check', { code: joinCode });
+    return checkRoom(joinCode);
   }
   if (kind === 'name') {
     const name = app.querySelector('#nickname').value.trim();
@@ -320,16 +411,24 @@ app.addEventListener('submit', event => {
   }
 });
 
-socket.on('connect', resume);
+socket.on('connect', () => {
+  if (screen === 'join-invite') checkRoom(joinCode);
+  else if (screen === 'resuming' || screen === 'room') resume();
+});
 socket.on('connect_error', () => notify('The game server is unavailable. Reconnecting…'));
 socket.on('disconnect', () => { pendingChoice = null; notify('Connection lost. Reconnecting…'); });
-socket.on('room:check-result', data => { joinCode = data.code; show('join-name'); });
 socket.on('host:created', data => {
   role = 'host';
+  lanAddresses = data.lanAddresses || [];
+  clearInvitation();
   storeSession({ role, code: data.code, token: data.token });
 });
-socket.on('host:resumed', () => { role = 'host'; restoring = true; });
+socket.on('host:resumed', data => {
+  role = 'host'; restoring = true; lanAddresses = data.lanAddresses || [];
+  clearInvitation();
+});
 socket.on('player:joined', data => {
+  clearInvitation();
   role = 'player'; playerId = data.playerId; myName = data.name;
   choice = data.answerChoice ?? null; pendingChoice = null; personal = data.standing ?? null; restoring = true;
   storeSession({ role, code: data.code, playerId, token: data.token });
@@ -348,14 +447,25 @@ socket.on('room:answer-count', count => {
   if (label) label.textContent = `${count} / ${room.totalPlayers} answered`;
 });
 for (const event of ['player:resume-denied', 'host:resume-denied']) {
-  socket.on(event, () => { home(); notify('That room session has expired.'); });
+  socket.on(event, () => {
+    if (invitation && /^\d{6}$/.test(invitation)) {
+      storeSession(null);
+      joinCode = invitation;
+      show('join-invite');
+      checkRoom(joinCode);
+    } else { home(); notify('That room session has expired.'); }
+  });
 }
 socket.on('app:error', message => {
   app.querySelectorAll('button[data-action="start"], button[data-action="next"], button[data-action="reveal"], form[data-form="name"] .wide')
     .forEach(button => { button.disabled = false; });
+  if (screen === 'join-name') {
+    app.querySelector('[role="alert"]').textContent = message;
+    return;
+  }
   notify(message);
 });
 socket.on('room:closed', () => { home(); notify('This room has closed.'); });
 
-show(screen);
+show(screen, invitation !== null && !joinCode ? 'This invite needs a six-digit room code.' : null);
 socket.connect();
